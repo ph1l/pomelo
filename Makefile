@@ -1,5 +1,5 @@
 CC=gcc
-CFLAGS=-Wall -g
+CFLAGS=-Wall -g $(shell gpgme-config --thread=pthread --cflags)
 
 SRC=pomelo.c
 BIN=pomelo
