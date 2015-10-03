@@ -673,7 +673,7 @@ _fail:
 
 
 /* show the decoded message */
-static void display_decoded(decode_t *d, WINDOW *outwin)
+static void display_decoded(decode_t *d, WINDOW *outwin, WINDOW *statwin)
 {
 	char			*uid;
 	gpgme_recipient_t	r;
@@ -686,7 +686,8 @@ static void display_decoded(decode_t *d, WINDOW *outwin)
 	g++;
 	g %= sizeof(fun);
 
-	mvprintw(scry - 2, 0, "%c %i/%i/%i/%i", fun[g], received_msgs_depth, encoded_msgs_depth, decoded_msgs_depth, plain_msgs_depth);
+	mvwprintw(statwin, 0, 0, "%c %i/%i/%i/%i", fun[g], received_msgs_depth, encoded_msgs_depth, decoded_msgs_depth, plain_msgs_depth);
+	wclrtoeol(statwin);
 
 	/* TODO: for now just throwing the messages into a scrollok ncurses window, no scrollback or anything */
 	/* I want scrollback and potentially threaded/filtered views, probably put them into a linked list and perhaps
@@ -699,8 +700,8 @@ static void display_decoded(decode_t *d, WINDOW *outwin)
 		   gpgme_err_code(d->decrypt_err) != GPG_ERR_BAD_DATA &&
 		   gpgme_err_code(d->decrypt_err) != GPG_ERR_DECRYPT_FAILED &&
 		   gpgme_err_code(d->decrypt_err) != GPG_ERR_INV_DATA) {
-			mvprintw(scry - 2, 20, "decrypt error: %s (%u)", gpgme_strerror(d->decrypt_err), d->decrypt_err);
-			clrtoeol();
+			mvwprintw(statwin, 0, 20, "decrypt error: %s (%u)", gpgme_strerror(d->decrypt_err), d->decrypt_err);
+			wclrtoeol(statwin);
 		}
 		/* TODO: display useful error information for non-expected normal noise decode errors */
 		return;
@@ -798,7 +799,7 @@ int main(int argc, const char *argv[])
 			encoder_thread,
 			receiver_thread,
 			xmitter_thread;
-	WINDOW		*outwin;
+	WINDOW		*outwin, *statwin;
 	char		input[255];
 	int		input_len = 0, cursor_pos = 0;
 
@@ -835,9 +836,15 @@ int main(int argc, const char *argv[])
 
 	clrtobot();
 	getmaxyx(stdscr, scry, scrx);
-	outwin = newwin(scry - 2, scrx, 0, 0);
+
+	outwin = newwin(scry - 1, scrx, 0, 0);
 	wclrtobot(outwin);
+	idlok(outwin, true);
 	scrollok(outwin, true); // XXX TODO just for now, while there's no history
+
+	statwin = newwin(1, scrx, scry - 2, 0);
+	wbkgdset(statwin, A_REVERSE);
+	scrollok(statwin, false);
 	refresh();
 
 	/* setup a simple pipe for waking up the UI when there's new messages to show */
@@ -901,11 +908,11 @@ int main(int argc, const char *argv[])
 						encode_t	*e;
 						const char	*errmsg;
 						if(!(e = input_to_encode(input, input_len, &errmsg))) {
-							mvprintw(scry - 2, 20, "Input error: %s\n", errmsg);
-							clrtoeol();
+							mvwprintw(statwin, 0, 20, "Input error: %s\n", errmsg);
+							wclrtoeol(statwin);
 							break;
 						}
-						move(scry - 2, 0);
+						move(scry - 1, 0);
 						clrtoeol();
 
 						q_put(plain_msgs, e, encoded_msgs);
@@ -966,12 +973,13 @@ int main(int argc, const char *argv[])
 
 			read(uipc[0], &c, 1);
 			q_get(decoded_msgs, decode_t, d, decoded_msgs);
-			display_decoded(d, outwin);
+			display_decoded(d, outwin, statwin);
 			decode_free(d);
 		}
 
 
 		move(scry - 1, cursor_pos);
+		wrefresh(statwin);
 		refresh();
 	} while(poll(pfds, nelems(pfds), INFTIM) != -1);
 
