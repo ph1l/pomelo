@@ -62,6 +62,7 @@ typedef struct _times_t {
 typedef struct _decode_t {
 	list_head_t		decoded_msgs;
 	times_t			times;
+	uint64_t		seqnum;
 
 	msg_t			raw;		/* raw message from the wire */
 
@@ -387,6 +388,10 @@ static void decode_free(decode_t *d)
 /* receive a message into m->raw for decoding */
 static void decode_recv(decode_t *m)
 {
+	static uint64_t	seqnum = 1;
+
+	m->seqnum = seqnum++;
+
 	get_sock();
 
 retry_len:
@@ -968,15 +973,37 @@ int main(int argc, const char *argv[])
 
 		/* decoded messages */
 		if(pfds[1].revents & POLLIN) {
-			decode_t	*d;
+			static uint64_t	last_seqnum;		/* seqnum of last _displayed_ message */
+			static 		LIST_HEAD(ooo_msgs);	/* place to collect potentially out-of-order messages until they are in-order */
+			decode_t	*d, *pos, *_pos;
 			char		c;
 
 			read(uipc[0], &c, 1);
 			q_get(decoded_msgs, decode_t, d, decoded_msgs);
-			display_decoded(d, outwin, statwin);
-			decode_free(d);
-		}
 
+			/* insert the decoded (or errored) msg in-order on ooo_msgs according to seqnum */
+			if(list_empty(&ooo_msgs)) {
+				list_add(&d->decoded_msgs, &ooo_msgs);
+			} else {
+				list_for_each_entry(pos, &ooo_msgs, decoded_msgs) {
+					if(d->seqnum < pos->seqnum)
+						break;
+				}
+				list_add_tail(&d->decoded_msgs, &pos->decoded_msgs);
+			}
+
+			/* consume the from ooo_msgs until a gap is found */
+			list_for_each_entry_safe(pos, _pos, &ooo_msgs, decoded_msgs) {
+				if(pos->seqnum <= (last_seqnum + 1)) {
+					last_seqnum = pos->seqnum;
+					list_del(&pos->decoded_msgs);
+					display_decoded(pos, outwin, statwin);
+					decode_free(pos);
+				} else {
+					break;
+				}
+			}
+		}
 
 		move(scry - 1, cursor_pos);
 		wrefresh(statwin);
