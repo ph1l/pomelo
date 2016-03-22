@@ -46,6 +46,7 @@
 #define DECODER_THREADS	20
 #define SPLODE_PORT	31337
 
+#define MIN_NOTIFY_INTERVAL 60
 #define VERSION "0.0.1"
 
 /* raw splode message */
@@ -522,6 +523,59 @@ static int input_append(const char *str, const char ***arr, int *arr_len)
 	return 1;
 }
 
+/* availability publishing */
+static void notifier(int *uipc)
+{
+	gpgme_ctx_t	ctx;
+	gpgme_key_t	key;
+	gpgme_error_t	err;
+	char		msg[255];
+	int		n_recipients;
+	gpgme_subkey_t	subkey;
+
+	/* TODO: allow user configuration to decide to whom we publish
+	   notifications to. */
+	gpgme_new(&ctx);
+	for(;;) {
+		encode_t *e = NULL;
+		n_recipients = 0;
+
+		sleep(MIN_NOTIFY_INTERVAL);
+		snprintf(msg, sizeof(msg), "\001NOTIFY %d", (int)time(NULL));
+
+		if(!(e = encode_alloc())) {
+			continue;
+		}
+
+		e->input.buf=NULL;
+		e->input.sign=1;
+
+		err = gpgme_op_keylist_start (ctx, NULL, 0);
+		while(!err) {
+			err = gpgme_op_keylist_next(ctx, &key);
+			if (err) break;
+			subkey = key->subkeys;
+			while (subkey) {
+				if (subkey->disabled || subkey->revoked ||
+					subkey->expired || subkey->invalid )
+						goto _skip;
+				if (subkey->can_encrypt) {
+					input_append(strdup(subkey->keyid),
+						&e->input.recipients,
+						&e->input.n_recipients);
+					n_recipients++;
+				}
+_skip:
+				subkey = subkey->next;
+			}
+			gpgme_key_release (key);
+		}
+		e->input.msg=strdup(msg);
+		q_put(plain_msgs, e, encoded_msgs);
+	}
+	gpgme_release (ctx);
+}
+
 static void ctcp_pong(char *keyid, char *arg)
 {
 	char		msg[255];
@@ -604,6 +658,7 @@ static int input_parse(const char *str, int len, parse_t *e, const char **errmsg
 	 * CTCP Commands:
 	 *     "@fd25ef92# VERSION"
 	 *     "@fd25ef92# PING 1458456098"
+	 *     "@fd25ef92# NOTIFY"
 	 *
 	 */
 	infsm_t	state = IN_NONE;
@@ -952,7 +1007,8 @@ int main(int argc, const char *argv[])
 	pthread_t	decoder_threads[DECODER_THREADS],
 			encoder_thread,
 			receiver_thread,
-			xmitter_thread;
+			xmitter_thread,
+			notifier_thread;
 	WINDOW		*outwin, *statwin;
 	char		input[255];
 	int		input_len = 0, cursor_pos = 0;
@@ -1014,6 +1070,7 @@ int main(int argc, const char *argv[])
 	pthread_create(&encoder_thread, NULL, (void *(*)(void *))encoder, NULL);
 	pthread_create(&receiver_thread, NULL, (void *(*)(void *))receiver, NULL);
 	pthread_create(&xmitter_thread, NULL, (void *(*)(void *))xmitter, NULL);
+	pthread_create(&notifier_thread, NULL, (void *(*)(void *))notifier, NULL);
 
 	/* wait for user and/or decoder input */
 	do {
