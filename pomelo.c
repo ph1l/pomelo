@@ -46,6 +46,8 @@
 #define DECODER_THREADS	20
 #define SPLODE_PORT	31337
 
+#define VERSION "0.0.1"
+
 /* raw splode message */
 typedef struct _msg_t {
 	uint16_t	len;
@@ -74,12 +76,13 @@ typedef struct _decode_t {
 	gpgme_key_t		*recipient_keys;
 	gpgme_key_t		*signature_keys;
 
+	char			type;
 	const char		*msg;
 	int			msg_len;
 } decode_t;
 
 /* entered messages are split into this according to a simple syntax */
-typedef struct _parse_t {
+typedef struct _raw_t {
 	const char		*buf;		/* indexed raw input */
 	int			buf_len;
 
@@ -90,15 +93,16 @@ typedef struct _parse_t {
 	int			n_signatures;
 	int			sign:1;
 
+	char			type;
 	const char		*msg;
-} parse_t;
+} raw_t;
 
 /* messages go from .input to .plain then encoded into .encrypted to send() */
 typedef struct _encode_t {
 	list_head_t		encoded_msgs;
 	times_t			times;
 
-	parse_t			input;		/* parsed/indexed input */
+	raw_t			input;		/* parsed/indexed input */
 
 	gpgme_data_t		plain;		/* plaintext input message */
 	gpgme_key_t		*recipients;	/* array of recipients */
@@ -289,8 +293,10 @@ static void encode(gpgme_ctx_t *ctx, encode_t *e)
 			      &e->recipients[i], 0);
 	}
 
-	gpgme_data_new_from_mem(&e->plain, e->input.msg,
-				strlen(e->input.msg), 1);
+	gpgme_data_new(&e->plain);
+	gpgme_data_write(e->plain, &e->input.type, 1);
+	gpgme_data_write(e->plain, e->input.msg, strlen(e->input.msg));
+	gpgme_data_seek(e->plain, 0, SEEK_SET);
 	gpgme_data_new(&e->encrypt_data);
 
 	/* TODO: map the specified signatures to the gpgme context */
@@ -427,6 +433,7 @@ static void decode(gpgme_ctx_t *ctx, decode_t *d)
 	gpgme_data_t	cipher;
 	gpgme_error_t	err;
 	off_t		len;
+	char		msg_type;
 	char		*out;
 
         gpgme_data_new_from_mem(&cipher, (const char *)d->raw.bytes,
@@ -451,11 +458,13 @@ static void decode(gpgme_ctx_t *ctx, decode_t *d)
 		/* TODO: use gpgme_data_release_and_get_mem() instead of
 		 * allocating space for and copying out the decrypted buffer.
 		 */
-		out = calloc(len, sizeof(char));
-		gpgme_data_read(d->plain, out, len);
+		out = calloc(len-1, sizeof(char));
+		gpgme_data_read(d->plain, &msg_type, 1);
+		gpgme_data_read(d->plain, out, len-1);
 
+		d->type = msg_type;
 		d->msg = out;
-		d->msg_len = len;
+		d->msg_len = len-1;
 
 		/* fetch the keys for all recipients and signatures */
 #define getkeys(_a, _i, _h, _t, _id)					\
@@ -491,9 +500,6 @@ static void decoder(int *uipc)
 	}
 }
 
-
-/* user input stuff */
-
 /* helper for growing the signature and recipient arrays */
 static int input_append(const char *str, const char ***arr, int *arr_len)
 {
@@ -506,6 +512,59 @@ static int input_append(const char *str, const char ***arr, int *arr_len)
 	return 1;
 }
 
+static void send_ctcp_msg(char *keyid, char *msg_in)
+{
+	char		*buf, *msg;
+	int		buflen;
+	encode_t        *e = NULL;
+
+	if(!(e = encode_alloc()))
+		return;
+
+	/* CTCP should be signed! */
+	e->input.sign=1;
+	e->input.type=1;
+
+	buflen=strlen(keyid)+1+strlen(msg_in)+1;
+
+	buf=malloc(buflen);
+
+	sprintf(buf, "%s",keyid);
+	msg = buf+strlen(keyid)+1;
+	sprintf(msg, "%s",msg_in);
+
+	input_append(buf,
+		&e->input.recipients,
+		&e->input.n_recipients);
+
+	e->input.msg=msg;
+
+	q_put(plain_msgs, e, encoded_msgs);
+}
+
+static void ctcp_pong(char *keyid, char *arg)
+{
+	char		msg[255];
+
+	if(*arg) {
+		snprintf(msg, sizeof(msg), "PONG %s", arg);
+	} else {
+		snprintf(msg, sizeof(msg), "PONG");
+	}
+	send_ctcp_msg(keyid, msg);
+}
+
+static void ctcp_version(char *keyid)
+{
+	char		msg[255];
+
+	snprintf(msg, sizeof(msg), "VERSION %s", VERSION);
+	send_ctcp_msg(keyid, msg);
+}
+
+
+/* user input stuff */
+
 /* some states for the input parser below */
 typedef enum _infsm_t {
 	IN_NONE	= 0,
@@ -513,12 +572,14 @@ typedef enum _infsm_t {
 	IN_SIGNATURE_MAYBE,
 	IN_SIGNATURE,
 	IN_NIL_SIGNATURE,
+	IN_CTCP,
+	IN_CTCP_COMMAND,
 	IN_MESSAGE
 } infsm_t;
 
 /* rudimentary parser for input strings */
 /* take str of input, produce structured output in *e or errors in *errmsg */
-static int input_parse(const char *str, int len, parse_t *e, const char **errmsg)
+static int input_parse(const char *str, int len, raw_t *e, const char **errmsg)
 {
 	/* parse str according to these rules:
 	 * one or more @key specifiers, which forms the recipients list
@@ -532,6 +593,11 @@ static int input_parse(const char *str, int len, parse_t *e, const char **errmsg
 	 * Eventually local aliases for gpg key ids will be supported like:
 	 *     "@linux$ Hi guys."
 	 *     "@ops$ego Hola"
+	 *
+	 * CTCP Commands:
+	 *     "@fd25ef92# VERSION"
+	 *     "@fd25ef92# PING 1458456098"
+	 *
 	 */
 	infsm_t	state = IN_NONE;
 	int	i;
@@ -567,7 +633,7 @@ static int input_parse(const char *str, int len, parse_t *e, const char **errmsg
 			break;
 
 		case IN_RECIPIENT:
-			if(c == '@' || c == '$' || c == '!') {
+			if(c == '@' || c == '$' || c == '!' || c == '#') {
 				if(this_start == &istr[i]) {
 					*errmsg = "empty recipient";
 					goto _fail;
@@ -583,6 +649,9 @@ static int input_parse(const char *str, int len, parse_t *e, const char **errmsg
 				} else if(c == '!') {
 					signatures = -1;
 					state = IN_NIL_SIGNATURE;
+				} else if(c == '#') {
+					state = IN_CTCP;
+					signatures++;
 				}
 				this_start = &istr[i + 1];
 			}
@@ -619,6 +688,18 @@ static int input_parse(const char *str, int len, parse_t *e, const char **errmsg
 			this_start = &istr[i + 1];
 			break;
 
+		case IN_CTCP:
+			if(c != ' ') {
+				*errmsg = "space required after # command key";
+				goto _fail;
+			}
+			state = IN_CTCP_COMMAND;
+			this_start = &istr[i + 1];
+			break;
+
+		case IN_CTCP_COMMAND:
+			break;
+
 		case IN_MESSAGE:
 			/* TODO: restrict message chars? */
 			break;
@@ -628,8 +709,13 @@ static int input_parse(const char *str, int len, parse_t *e, const char **errmsg
 		}
 	}
 
-	if(state == IN_MESSAGE)
+	if(state == IN_MESSAGE) {
+		e->type = 0;
 		e->msg = this_start;
+	} else if(state == IN_CTCP_COMMAND) {
+		e->type = 1;
+		e->msg = this_start;
+	}
 
 	if(!signatures) {
 		*errmsg = "trailing signature key required (!=unsigned | $=signed | $key=signed using key)";
@@ -676,11 +762,64 @@ _fail:
 	return NULL;
 }
 
+static int handle_ctcp( decode_t *d )
+{
+	int			i, count=0;
+	char			arg[129], ctcp_command[17];
+	char			*uid;
+	gpgme_ctx_t		ctx;
+	gpgme_signature_t	s;
+	gpgme_key_t		key;
+	gpgme_error_t		err;
+
+	if(!d->type == 1)
+		return -1;
+
+	if(!d->verify_res)
+		return -1;
+
+	if (sscanf(d->msg, "%16s", (char *)&ctcp_command) != 1)
+		return -1;
+
+	gpgme_new(&ctx);
+
+	for(i = 0, s = d->verify_res->signatures; s; s = s->next, i++) {
+
+		err = gpgme_op_keylist_start (ctx, s->fpr, 0);
+		if (err)
+			continue;
+		err = gpgme_op_keylist_next(ctx, &key);
+		if (err)
+			continue;
+		uid = key->subkeys->keyid;
+
+		/* TODO: verify uid is someone we want to CTCP with */
+
+		if(strncmp((char *)&ctcp_command, "PING", 4) == 0) {
+
+			if(sscanf(d->msg, "PING %128s", (char *)&arg) != 1) {
+				arg[0]='\0';
+			}
+			ctcp_pong(uid, (char *)&arg);
+
+		} else if(strncmp((char *)&ctcp_command, "VERSION", 7) == 0) {
+
+			if(strlen(d->msg) == 7)
+				ctcp_version(uid);
+
+		}
+		count++;
+	}
+
+	gpgme_release (ctx);
+
+	return count;
+}
 
 /* show the decoded message */
 static void display_decoded(decode_t *d, WINDOW *outwin, WINDOW *statwin)
 {
-	char			*uid;
+	char			*uid, *extra;
 	gpgme_recipient_t	r;
 	gpgme_signature_t	s;
 	int			i;
@@ -760,8 +899,13 @@ static void display_decoded(decode_t *d, WINDOW *outwin, WINDOW *statwin)
 		}
 		wprintw(outwin, "%s%s", i ? ", " : "", uid);
 	}
-	
-	wprintw(outwin, ": %.*s%s", d->msg_len, d->msg, d->msg[d->msg_len - 1] == '\n' ? "" : "\n");
+
+	if(handle_ctcp(d) > 0)
+		extra = "(CTCP) ";
+	else
+		extra = "";
+
+	wprintw(outwin, ": %s%s%s", extra, d->msg, d->msg[strlen(d->msg) - 1] == '\n' ? "" : "\n");
 	wrefresh(outwin);
 }
 
